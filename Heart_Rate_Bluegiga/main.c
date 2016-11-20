@@ -1,4 +1,8 @@
+#ifdef PLATFORM_WIN
 #include <windows.h>
+#else
+#include <unistd.h>
+#endif
 
 #include <stdlib.h>
 #include <stdio.h>
@@ -9,12 +13,13 @@
 #include "cmd_def.h"
 #include "uart.h"
 
-#define DEBUG
+//#define DEBUG
 
 #define CLARG_PORT 1
 #define CLARG_ACTION 2
+#define CLARG_ACTION_TYPE 3
 
-#define UART_TIMEOUT 1000
+#define UART_TIMEOUT 5000
 
 #define MAX_DEVICES 64
 int found_devices_count = 0;
@@ -65,10 +70,12 @@ uint16 heart_rate_handle_start = 0,
        heart_rate_handle_configuration = 0;
 
 bd_addr connect_addr;
+uint8	connect_addr_type = 0;
+
 
 void usage(char *exe)
 {
-    printf("%s <COMx|list> <scan|address>\n", exe);
+    printf("%s <COMx|list> <scan|address [addess_type]>\n", exe);
 }
 
 void change_state(states new_state)
@@ -77,6 +84,16 @@ void change_state(states new_state)
     printf("DEBUG: State changed: %s --> %s\n", state_names[state], state_names[new_state]);
 #endif
     state = new_state;
+}
+
+void cross_sleep(int sleep_ms)
+{
+#ifdef PLATFORM_WIN
+	Sleep(sleep_ms);
+#else
+	usleep(sleep_ms * 1000);   // usleep takes sleep time in us (1 millionth of a second)
+#endif
+
 }
 
 /**
@@ -166,9 +183,9 @@ int read_message(int timeout_ms)
     return 0;
 }
 
-void enable_indications(uint8 connection_handle, uint16 client_configuration_handle)
+void enable_notifications(uint8 connection_handle, uint16 client_configuration_handle)
 {
-    uint8 configuration[] = {0x01, 0x00}; // enable indications
+    uint8 configuration[] = {0x01, 0x00}; // enable notification
     ble_cmd_attclient_attribute_write(connection_handle, heart_rate_handle_configuration, 2, &configuration);
 }
 
@@ -198,7 +215,7 @@ void ble_evt_gap_scan_response(const struct ble_msg_gap_scan_response_evt_t *msg
     }
     found_devices_count++;
     memcpy(found_devices[i].addr, msg->sender.addr, sizeof(bd_addr));
-
+	connect_addr_type = msg->address_type;
     // Parse data
     for (i = 0; i < msg->data.len; ) {
         int8 len = msg->data.data[i++];
@@ -221,6 +238,7 @@ void ble_evt_gap_scan_response(const struct ble_msg_gap_scan_response_evt_t *msg
     printf(" Name:");
     if (name) printf("%s", name);
     else printf("Unknown");
+	printf(" addess_type:%d", msg->address_type);
     printf("\n");
 
     free(name);
@@ -233,10 +251,10 @@ void ble_evt_connection_status(const struct ble_msg_connection_status_evt_t *msg
         change_state(state_connected);
         printf("Connected\n");
 
-        // Handle for Temperature Measurement configuration already known
+        // Handle for Heart Rate Measurement configuration already known
         if (heart_rate_handle_configuration) {
             change_state(state_listening_measurements);
-            enable_indications(msg->connection, heart_rate_handle_configuration);
+            enable_notifications(msg->connection, heart_rate_handle_configuration);
         }
         // Find primary services
         else {
@@ -276,12 +294,12 @@ void ble_evt_attclient_procedure_completed(const struct ble_msg_attclient_proced
         // Client characteristic configuration not found
         if (heart_rate_handle_configuration == 0) {
             printf("No Client Characteristic Configuration found for Health heart_rate service\n");
-            //change_state(state_finish);
+            change_state(state_finish);
         }
-        // Enable temperature notifications
+        // Enable heart rate notifications
         else {
             change_state(state_listening_measurements);
-            enable_indications(msg->connection, heart_rate_handle_configuration);
+            enable_notifications(msg->connection, heart_rate_handle_configuration);
         }
     }
 }
@@ -293,42 +311,83 @@ void ble_evt_attclient_find_information_found(const struct ble_msg_attclient_fin
 
         if (uuid == HEART_RATE_MEASUREMENT_UUID) {
             heart_rate_handle_measurement = msg->chrhandle;
-			printf("heart_rate_handle_measurement was found");
+			printf("heart_rate_handle_measurement was found\n");
         }
         else if (uuid == HEART_RATE_MEASUREMENT_CONFIG_UUID) {
             heart_rate_handle_configuration = msg->chrhandle;
-			printf("heart_rate_handle_configuration was found");
+			printf("heart_rate_handle_configuration was found\n");
         }
     }
 }
 
-//#define THERMOMETER_FLAGS_FAHRENHEIT 0x1
+
 void ble_evt_attclient_attribute_value(const struct ble_msg_attclient_attribute_value_evt_t *msg)
 {
-	/*
-    if (msg->value.len < 5) {
-        printf("Not enough fields in Temperature Measurement value");
-        change_state(state_finish);
-    }
+	
+	if (msg->value.len < 2) {
+		printf("Not enough fields in Heart Rate Measurement value");
+		change_state(state_finish);
+	}
 
-    uint8 flags = msg->value.data[0];
-    int8 exponent = msg->value.data[4];
-    int mantissa = (msg->value.data[3] << 16) | (msg->value.data[2] << 8) | msg->value.data[1];
+	// Heart Rate Profile defined flags 
+	const unsigned char HEART_RATE_VALUE_FORMAT = 0x01;
+	const unsigned char ENERGY_EXPENDED_STATUS = 0x08;
+	const unsigned char RR_INTERVAL = 0x10;
 
-    float value = mantissa * pow(10, exponent);
-    if (exponent >= 0)
-        exponent = 0;
-    else
-        exponent = abs(exponent);
-    printf("Temperature: %.*f ", exponent, value);
+	unsigned char current_offset = 0;
+	unsigned char flags = msg->value.data[current_offset];
+	int is_heart_rate_value_size_long = ((flags & HEART_RATE_VALUE_FORMAT) != 0);
+	int has_expended_energy = ((flags & ENERGY_EXPENDED_STATUS) != 0);
+	int has_rr_intervals = ((flags & RR_INTERVAL) != 0);
 
-    if (flags & THERMOMETER_FLAGS_FAHRENHEIT)
-        printf("F");
-    else
-        printf("C");
-    printf("\n");
+	current_offset++;
 
-	*/
+	uint16 heart_rate_measurement_value = 0;
+
+	if (is_heart_rate_value_size_long)
+	{
+		heart_rate_measurement_value = (uint16)((msg->value.data[current_offset + 1] << 8) +
+			msg->value.data[current_offset]);
+		current_offset += 2;
+	}
+	else
+	{
+		heart_rate_measurement_value = msg->value.data[current_offset];
+		current_offset++;
+	}
+
+	printf("Heart rate measurment value: %d ", heart_rate_measurement_value);
+
+	uint16 expended_energy_value = 0;
+
+	if (has_expended_energy)
+	{
+		expended_energy_value = (uint16)((msg->value.data[current_offset + 1] << 8) +
+			msg->value.data[current_offset]);
+		current_offset += 2;
+
+		printf(" Expended energy value: %d ", expended_energy_value);
+	}
+
+	uint16 rr_intervals[10] = {0};
+
+	if (has_rr_intervals)
+	{
+		printf(" Rr intervals: ");
+
+		int rr_intervals_count = (msg->value.len - current_offset) / 2;
+
+		for (int i = 0; i < rr_intervals_count; i++)
+		{
+			int raw_rr_interval = (uint16)((msg->value.data[current_offset + 1] << 8) +
+				msg->value.data[current_offset]);
+			rr_intervals[i] = ((double)raw_rr_interval / 1024) * 1000;
+			current_offset += 2;
+
+			printf("%d ", rr_intervals[i]);
+		}
+		printf("\n");
+	}
 }
 
 void ble_evt_connection_disconnected(const struct ble_msg_connection_disconnected_evt_t *msg)
@@ -336,7 +395,7 @@ void ble_evt_connection_disconnected(const struct ble_msg_connection_disconnecte
     change_state(state_disconnected);
     printf("Connection terminated, trying to reconnect\n");
     change_state(state_connecting);
-	ble_cmd_gap_connect_direct(&connect_addr, gap_address_type_random, 60, 75, 100, 0);
+	ble_cmd_gap_connect_direct(&connect_addr, connect_addr_type, 60, 75, 100, 0);
 }
 
 int main(int argc, char *argv[]) {
@@ -387,6 +446,11 @@ int main(int argc, char *argv[]) {
                 for (i = 0; i < 6; i++) {
                     connect_addr.addr[i] = addr[i];
                 }
+
+				if (argc > CLARG_ACTION_TYPE) {
+					connect_addr_type = argv[CLARG_ACTION_TYPE][0] -'0';
+				}
+
                 action = action_connect;
             }
         }
@@ -407,7 +471,7 @@ int main(int argc, char *argv[]) {
     ble_cmd_system_reset(0);
     uart_close();
     do {
-        Sleep(500); // 0.5s
+		cross_sleep(500); // 0.5s
     } while (uart_open(uart_port));
 
     // Execute action
@@ -420,7 +484,7 @@ int main(int argc, char *argv[]) {
     else if (action == action_connect) {
         printf("Trying to connect\n");
         change_state(state_connecting);
-        ble_cmd_gap_connect_direct(&connect_addr, gap_address_type_random, 60, 75, 100,0);
+        ble_cmd_gap_connect_direct(&connect_addr, connect_addr_type, 60, 75, 100,0);
     }
 
     // Message loop
